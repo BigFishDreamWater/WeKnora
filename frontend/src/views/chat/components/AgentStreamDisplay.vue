@@ -497,7 +497,11 @@ import { getKnowledgeChunksSummaryHtml } from '@/utils/knowledgeChunksDisplay';
 import { getAttachmentParsingSummaryHtml } from '@/utils/attachmentParsingDisplay';
 import { useChatCitationPopover } from '@/composables/useChatCitationPopover';
 import { useChatReferencesDrawer } from '@/composables/useChatReferencesDrawer';
-import type { KnowledgeReferenceLike, ReferenceHighlightTarget } from '@/utils/referenceSources';
+import {
+  mergeReferenceSources,
+  type KnowledgeReferenceLike,
+  type ReferenceHighlightTarget,
+} from '@/utils/referenceSources';
 import { resolveCitationChunkId } from '@/utils/citationMarkdown';
 import { getWikiPage, type WikiPage } from '@/api/wiki';
 import { MessagePlugin } from 'tdesign-vue-next';
@@ -507,6 +511,7 @@ import { useAuthStore } from '@/stores/auth';
 import { useI18n } from 'vue-i18n';
 import i18n from '@/i18n';
 import { hydrateProtectedFileImages, clearProtectedFileFailureCache, sanitizeMarkdownHTML } from '@/utils/security';
+import type { ProtectedFileAccessContext } from '@/utils/protectedFileAccess';
 import { unwrapFinalAnswerWrappers, thinkingEqualsAnswer } from '@/utils/finalAnswer';
 import { getAgentToolIconName } from '@/utils/agent-tool-icons';
 import { getQueryText, getWikiPageText } from '@/utils/agent-tool-display';
@@ -676,7 +681,7 @@ const currentWikiKbId = ref<string>('');
 function getTypeTheme(type: string): string {
   const map: Record<string, string> = {
     summary: 'primary', entity: 'success', concept: 'warning',
-    synthesis: 'primary', comparison: 'danger', index: 'default', log: 'default',
+    synthesis: 'primary', comparison: 'danger', index: 'default',
   };
   return map[type] || 'default';
 }
@@ -689,7 +694,6 @@ function getTypeLabel(type: string): string {
     synthesis: t('knowledgeEditor.wikiBrowser.filterSynthesis'),
     comparison: t('knowledgeEditor.wikiBrowser.filterComparison'),
     index: 'Index',
-    log: 'Log',
   };
   return map[type] || type;
 }
@@ -719,7 +723,7 @@ const wikiDrawerContent = computed(() => {
 watch(wikiDrawerContent, async () => {
   await nextTick();
   if (wikiDrawerBodyRef.value) {
-    await hydrateProtectedFileImages(wikiDrawerBodyRef.value);
+    await hydrateProtectedFileImages(wikiDrawerBodyRef.value, protectedFileAccess.value);
   }
 });
 
@@ -818,13 +822,22 @@ const showRequestInfo = computed(
   () => !props.embeddedMode && !!(props.session?.request_id || props.session?.id),
 );
 
+// Agent answers embed exported charts and knowledge-base images as
+// `resource://` handles. An embed visitor has no Bearer token, so they must be
+// fetched through the channel-scoped proxy rather than the tenant one.
+const protectedFileAccess = computed<ProtectedFileAccessContext | undefined>(() =>
+  props.embeddedMode && props.embedChannelId && props.embedToken
+    ? { mode: 'embed', channelId: props.embedChannelId, token: props.embedToken }
+    : undefined,
+);
+
 const {
   float: citationFloat,
   rebind: rebindCitations,
   cancelClose: cancelCitationClose,
   scheduleClose: scheduleCitationClose,
 } = useChatCitationPopover(rootElement, {
-  getKnowledgeReferences: () => props.session?.knowledge_references,
+  getKnowledgeReferences: () => getReferencesForDrawer(),
   embedChannelId: () => (props.embeddedMode ? props.embedChannelId : undefined),
   embedToken: () => (props.embeddedMode ? props.embedToken : undefined),
   sessionId: () => props.sessionId,
@@ -838,16 +851,10 @@ const getReferencesForDrawer = (
   const messageReferences = refsOverride?.length
     ? refsOverride
     : props.session?.knowledge_references;
-  if (messageReferences?.length) return messageReferences;
-
-  // Agent answers can already contain citation tags before the aggregated
-  // knowledge_references event is emitted (and some restored conversations do
-  // not have that aggregate at all). The completed retrieval tool events still
-  // carry the same source data, so use them to keep citation clicks in the
-  // references drawer instead of falling through to KB-page navigation.
-  return (props.session?.agentEventStream || []).flatMap((event) =>
+  const toolReferences = (props.session?.agentEventStream || []).flatMap((event) =>
     getToolReferenceItems(event),
   );
+  return mergeReferenceSources(messageReferences, toolReferences);
 };
 
 const openReferencesDrawer = (
@@ -1225,7 +1232,7 @@ watch(eventStream, (stream) => {
   activeThinkingVersion.value++;
 
   nextTick(async () => {
-    await hydrateProtectedFileImages(rootElement.value);
+    await hydrateProtectedFileImages(rootElement.value, protectedFileAccess.value);
     await enhanceMarkdownContainer(rootElement.value);
     // Auto-scroll thinking detail content to bottom during streaming
     if (newActiveIds.size > 0 && rootElement.value) {
@@ -1402,7 +1409,7 @@ watch(answerFullyRendered, (ready) => {
   // suppressed by the missing-source cache.
   clearProtectedFileFailureCache();
   nextTick(async () => {
-    await hydrateProtectedFileImages(rootElement.value);
+    await hydrateProtectedFileImages(rootElement.value, protectedFileAccess.value);
   });
 }, { immediate: true });
 
@@ -1872,7 +1879,7 @@ const toggleIntermediateSteps = () => {
   showIntermediateSteps.value = !showIntermediateSteps.value;
   nextTick(async () => {
     if (rootElement.value) {
-      await hydrateProtectedFileImages(rootElement.value);
+      await hydrateProtectedFileImages(rootElement.value, protectedFileAccess.value);
     }
   });
 };
@@ -2192,7 +2199,7 @@ onMounted(() => {
     (root as any).__citationKeydown__ = keydownListener;
     root.addEventListener('keydown', keydownListener, true);
     rebindCitations();
-    await hydrateProtectedFileImages(rootElement.value);
+    await hydrateProtectedFileImages(rootElement.value, protectedFileAccess.value);
   });
 });
 
@@ -2216,7 +2223,7 @@ onUpdated(() => {
     // and idempotent: blob results are cached per URL, in-flight fetches are
     // de-duped, and failures back off for a cooldown — so a not-yet-ready file
     // simply retries later (and the answerFullyRendered pass is the backstop).
-    await hydrateProtectedFileImages(rootElement.value);
+    await hydrateProtectedFileImages(rootElement.value, protectedFileAccess.value);
   });
 });
 

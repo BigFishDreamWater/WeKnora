@@ -10,6 +10,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/storageurl"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
@@ -23,9 +24,10 @@ import (
 // @Tags         问答
 // @Accept       json
 // @Produce      text/event-stream
-// @Param        session_id  path      string  true  "会话ID"
-// @Param        message_id  query     string  true  "消息ID"
-// @Success      200         {object}  map[string]interface{}  "流式响应"
+// @Param        session_id     path      string  true   "会话ID"
+// @Param        message_id     query     string  true   "消息ID"
+// @Param        resource_urls  query     string  false  "文件引用形式，public 返回可加载直链"  Enums(handle, public)  default(handle)
+// @Success      200            {object}  map[string]interface{}  "流式响应"
 // @Failure      404         {object}  errors.AppError         "会话或消息不存在"
 // @Security     Bearer
 // @Security     ApiKeyAuth
@@ -53,9 +55,17 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 
 	logger.Infof(ctx, "Continuing stream, session ID: %s, message ID: %s", sessionID, messageID)
 
-	// Verify that the session exists and belongs to this tenant
-	_, err := h.sessionService.GetSession(ctx, sessionID)
+	// Resolve before any SSE header is written so an invalid resource_urls value
+	// is still reportable as a normal 400 JSON error.
+	resourceRewriter, err := h.resolveStreamRewriter(c)
 	if err != nil {
+		logger.Warnf(ctx, "Rejected resource URL mode: %v", err)
+		_ = c.Error(err)
+		return
+	}
+
+	// Verify that the session exists and belongs to this tenant
+	if _, err := h.sessionService.GetSession(ctx, sessionID); err != nil {
 		if stderrors.Is(err, errors.ErrSessionNotFound) {
 			logger.Warnf(ctx, "Session not found, ID: %s", sessionID)
 			c.Error(errors.NewNotFoundError(err.Error()))
@@ -129,9 +139,14 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 
 	// Check if stream is already completed
 	streamCompleted := false
+	streamErrored := false
 	for _, evt := range events {
 		if evt.Type == "complete" {
 			streamCompleted = true
+			break
+		}
+		if evt.Type == types.ResponseTypeError && evt.Done {
+			streamErrored = true
 			break
 		}
 	}
@@ -139,12 +154,14 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 	// Replay existing events
 	logger.Debugf(ctx, "Replaying %d existing events", len(events))
 	for _, evt := range events {
-		response := buildStreamResponse(evt, message.RequestID)
-		c.SSEvent("message", response)
-		c.Writer.Flush()
+		emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter)
 	}
 
-	// If stream is already completed, send final event and return
+	// If stream is already terminal, return after replaying the terminal event.
+	if streamErrored {
+		logger.Infof(ctx, "Stream already ended with terminal error, session ID: %s, message ID: %s", sessionID, messageID)
+		return
+	}
 	if streamCompleted {
 		logger.Infof(ctx, "Stream already completed, session ID: %s, message ID: %s", sessionID, messageID)
 		sendCompletionEvent(c, message.RequestID)
@@ -167,24 +184,33 @@ func (h *Handler) ContinueStream(c *gin.Context) {
 			newEvents, newOffset, err := h.streamManager.GetEvents(ctx, sessionID, messageID, currentOffset)
 			if err != nil {
 				logger.Errorf(ctx, "Failed to get new events: %v", err)
+				flushHeldStreamContent(ctx, c, message.RequestID, resourceRewriter)
 				return
 			}
 
 			// Send new events
 			streamCompletedNow := false
+			streamErroredNow := false
 			for _, evt := range newEvents {
 				// Check for completion event
 				if evt.Type == "complete" {
 					streamCompletedNow = true
 				}
+				if evt.Type == types.ResponseTypeError && evt.Done {
+					streamErroredNow = true
+				}
 
-				response := buildStreamResponse(evt, message.RequestID)
-				c.SSEvent("message", response)
-				c.Writer.Flush()
+				emitStreamEvent(ctx, c, evt, message.RequestID, resourceRewriter)
 			}
 
 			// Update offset
 			currentOffset = newOffset
+
+			// A terminal error already carries Done=true and is the final event.
+			if streamErroredNow {
+				logger.Infof(ctx, "Stream ended with terminal error, session ID: %s, message ID: %s", sessionID, messageID)
+				return
+			}
 
 			// If stream completed, send final event and exit
 			if streamCompletedNow {
@@ -326,6 +352,7 @@ func (h *Handler) handleAgentEventsForSSE(
 	sessionID, assistantMessageID, requestID string,
 	eventBus *event.EventBus,
 	waitForTitle bool,
+	resourceRewriter *storageurl.StreamRewriter,
 ) {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -356,6 +383,7 @@ func (h *Handler) handleAgentEventsForSSE(
 
 			// Send any new events
 			streamCompleted := false
+			streamErrored := false
 			titleReceived := false
 			for _, evt := range events {
 				// Check for stop event
@@ -375,6 +403,12 @@ func (h *Handler) handleAgentEventsForSSE(
 						})
 					}
 
+					// Release any buffered tail first: the answer generated
+					// before the stop is still the user's content, and in
+					// public resource URL mode part of it may be sitting in
+					// the holdback buffer.
+					flushHeldStreamContent(ctx, c, requestID, resourceRewriter)
+
 					// Send stop notification to frontend
 					c.SSEvent("message", &types.StreamResponse{
 						ID:           requestID,
@@ -386,12 +420,12 @@ func (h *Handler) handleAgentEventsForSSE(
 					return
 				}
 
-				// Build StreamResponse from StreamEvent
-				response := buildStreamResponse(evt, requestID)
-
 				// Check for completion event
 				if evt.Type == "complete" {
 					streamCompleted = true
+				}
+				if evt.Type == types.ResponseTypeError && evt.Done {
+					streamErrored = true
 				}
 
 				// Check for title event
@@ -399,18 +433,28 @@ func (h *Handler) handleAgentEventsForSSE(
 					titleReceived = true
 				}
 
-				// Check if connection is still alive before writing
+				// Check if connection is still alive before writing. Build the
+				// payload only after this check: in public resource URL mode
+				// building consumes the chunk into the holdback buffer, so an
+				// early return here would drop it.
 				if c.Request.Context().Err() != nil {
 					log.Info("Connection closed during event sending, stopping")
 					return
 				}
 
-				c.SSEvent("message", response)
-				c.Writer.Flush()
+				emitStreamEvent(ctx, c, evt, requestID, resourceRewriter)
 			}
 
 			// Update offset
 			lastOffset = newOffset
+
+			// A terminal error is the final stream event. The error payload
+			// already carries Done=true, so close the SSE loop without adding a
+			// misleading completion event.
+			if streamErrored {
+				log.Infof("Stream ended with terminal error for session=%s, message=%s", sessionID, assistantMessageID)
+				return
+			}
 
 			// Check if stream is completed - wait for title event only if needed and not already received
 			if streamCompleted {
@@ -436,9 +480,7 @@ func (h *Handler) handleAgentEventsForSSE(
 							}
 							if len(events) > 0 {
 								for _, evt := range events {
-									response := buildStreamResponse(evt, requestID)
-									c.SSEvent("message", response)
-									c.Writer.Flush()
+									emitStreamEvent(ctx, c, evt, requestID, resourceRewriter)
 									// If we got the title, we can exit
 									if evt.Type == types.ResponseTypeSessionTitle {
 										log.Infof("Title event received: %s", evt.Content)
